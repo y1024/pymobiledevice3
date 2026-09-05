@@ -4,7 +4,7 @@
 Chrome DevTools Protocol (CDP), so Chrome-compatible debugger clients can attach to
 Safari tabs and WebViews running on a connected device. One bridge instance serves
 both Chrome DevTools (per-page) and browser-level clients such as VS Code's
-JavaScript debugger.
+JavaScript debugger and test automation frameworks like Playwright and Puppeteer.
 
 ## Device prerequisites
 
@@ -92,10 +92,58 @@ Configuration notes:
 - Source-map warnings for third-party pages you don't control are harmless; silence
   them with `"sourceMaps": false` if they get noisy.
 
+## Test automation (Playwright, Puppeteer)
+
+A Chrome-protocol automation framework attaches through the same browser-level
+endpoint as VS Code, so the page runs on the real device while the test runs on your
+machine. This lets a web test suite drive a `WKWebView` in a real app, rather than a
+simulator or a desktop browser pretending to be one.
+
+```javascript
+const { chromium } = require('playwright');
+
+const browser = await chromium.connectOverCDP('http://127.0.0.1:9222');
+const page = browser.contexts()[0].pages()[0];
+
+await page.goto('https://example.com/');
+await page.locator('#search').fill('hello');
+await page.locator('button[type=submit]').click();
+await page.screenshot({ path: 'device.png' });
+```
+
+Puppeteer attaches the same way with
+`puppeteer.connect({ browserURL: 'http://127.0.0.1:9222' })`.
+
+What works: navigation and its waits (`goto`, `reload`, `waitForNavigation`,
+`waitForLoadState`), reading and evaluating, every text-input API (`fill`,
+`pressSequentially`, `type`, `press`, `keyboard.insertText`), clicking and hovering,
+screenshots, network observation (`page.on('request')`, `page.on('response')`), and
+child frames - including cross-origin ones nested several levels deep, through
+`page.frames()`, `frameLocator()` and `frame.evaluate()`.
+
+Attaching to a page that is *already open* works too: you do not have to be connected
+before it loads.
+
+Notes worth knowing when scripting against a device:
+
+- The first interaction with a newly created frame takes a few seconds while the
+  framework bootstraps its injected script inside that frame over USB. It is not a
+  hang - give the first frame interaction a generous timeout.
+- Everything is a USB round-trip, so per-call latency is far higher than against a
+  local browser. Prefer a few coarse `evaluate()` calls over many fine-grained ones
+  in a hot loop.
+- A page whose framework replaces the global `Promise` and minifies the replacement
+  (Angular with zone.js, for example) reports objects of that class without the
+  `promise` subtype, because the bridge recognises built-ins by their class name.
+  `await` still behaves; only code that inspects the subtype is affected.
+
 ## Caveats
 
-- WebKit allows a single inspector session per page: Chrome DevTools and VS Code can
-  debug different tabs concurrently, but not the same tab. A page already held by
-  another debugger is skipped after a short wait — detach the other client first.
+- WebKit allows a single inspector session per page, so two *separate* debuggers
+  cannot hold the same tab: Chrome DevTools and VS Code can debug different tabs
+  concurrently, but not the same one. A page already held by another debugger is
+  skipped after a short wait — detach the other client first. A single client may
+  open as many CDP sessions onto a page as it likes (Playwright does this when a
+  script also opens a raw `newCDPSession`); those share the one underlying session.
 - The page listing is polled, so tabs opened on the device after the attach are
   discovered (and auto-attached) within a couple of seconds.

@@ -20,7 +20,7 @@ Windows, Linux, and macOS.
 - Firmware update, recovery/DFU workflows
 - Notification listen/post
 - Querying and setting SpringBoard options
-- WebInspector automation
+- WebInspector automation, and a Chrome DevTools Protocol bridge for DevTools, VS Code, Playwright and Puppeteer
 - DDI/DVT developer tooling (iOS 17+ over a tunnel)
 - Backup and restore
 
