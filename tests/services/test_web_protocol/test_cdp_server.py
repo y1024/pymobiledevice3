@@ -955,6 +955,127 @@ async def testp_cdp_browser_endpoint_gives_each_attachment_its_own_session(lockd
             await client.close()
 
 
+async def testp_cdp_server_resolves_a_node_back_to_a_handle(lockdown: LockdownClient) -> None:
+    """
+    A client moves an element between execution contexts by describing it to get a backendNodeId
+    and resolving that id back to an object - which is what every locator-driven interaction with
+    something inside a child frame goes through. WebKit has no node identity that outlives a
+    description, so DOM.describeNode reported no usable id and the resolve that followed found
+    nothing: the action retried until it timed out, with nothing explaining why.
+
+    The resolve must also answer with a handle of its own. A client releases the handle it
+    described from, so answering with that same handle returns a reference it has already dropped.
+    """
+    async with cdp_server_with_safari_page(lockdown) as (port, targets):
+        client = CdpWebsocketClient(port, targets[0]["id"])
+        await asyncio.wait_for(client.connect(), TIMEOUT)
+        message_ids = itertools.count(1)
+        try:
+
+            async def command(method: str, params: dict[str, Any]) -> dict[str, Any]:
+                return await client.command(next(message_ids), method, params)
+
+            await command("Page.enable", {})
+            await command("Runtime.enable", {})
+            await command("Page.navigate", {"url": "https://example.com/"})
+
+            element = await command("Runtime.evaluate", {"expression": "document.body"})
+            object_id = element["result"]["result"]["objectId"]
+            described = await command("DOM.describeNode", {"objectId": object_id})
+            backend_node_id = described["result"]["node"].get("backendNodeId")
+            assert isinstance(backend_node_id, int) and backend_node_id, (
+                f"a described node must carry an id the client can name it by again: {described}"
+            )
+
+            resolved = await command("DOM.resolveNode", {"backendNodeId": backend_node_id})
+            assert "result" in resolved, f"a described node must resolve back: {resolved.get('error')}"
+            resolved_object_id = resolved["result"]["object"]["objectId"]
+            assert resolved_object_id != object_id, (
+                "resolving must answer with a handle of its own, not the one already described from"
+            )
+
+            # Releasing the original handle must leave the resolved one usable - that is the whole
+            # point of it being a separate handle.
+            await command("Runtime.releaseObject", {"objectId": object_id})
+            still_usable = await command(
+                "Runtime.callFunctionOn",
+                {
+                    "objectId": resolved_object_id,
+                    "functionDeclaration": "function() { return this.tagName; }",
+                    "returnByValue": True,
+                },
+            )
+            assert still_usable["result"]["result"]["value"] == "BODY", (
+                f"the resolved handle must still address the node: {still_usable}"
+            )
+        finally:
+            await client.close()
+
+
+async def testp_cdp_server_carries_a_user_gesture_through(lockdown: LockdownClient) -> None:
+    """
+    A client marks the calls it makes on the user's behalf as a user gesture. Chrome names that
+    `userGesture` and WebKit `emulateUserGesture`, and an unrecognized parameter is ignored - so
+    every such call ran with no gesture behind it.
+
+    That is not cosmetic. Anything the platform gates behind a gesture silently did nothing,
+    including focusing an element inside a cross-origin frame - which is what a client's fill()
+    does before typing, so it typed nowhere and left the field empty while reporting success.
+    """
+    async with cdp_server_with_safari_page(lockdown) as (port, targets):
+        client = CdpWebsocketClient(port, targets[0]["id"])
+        await asyncio.wait_for(client.connect(), TIMEOUT)
+        message_ids = itertools.count(1)
+        try:
+
+            async def command(method: str, params: dict[str, Any]) -> dict[str, Any]:
+                return await client.command(next(message_ids), method, params)
+
+            await command("Page.enable", {})
+            await command("Runtime.enable", {})
+            await command("Page.navigate", {"url": "https://example.com/"})
+
+            # execCommand('copy') is refused without a user gesture and allowed with one, so it
+            # reports whether the gesture actually reached the page.
+            gesture_probe = (
+                "(function () {"
+                "  const field = document.createElement('textarea');"
+                "  field.value = 'x';"
+                "  document.body.appendChild(field);"
+                "  field.select();"
+                "  const allowed = document.execCommand('copy');"
+                "  field.remove();"
+                "  return allowed;"
+                "})()"
+            )
+
+            async def probe(**extra: Any) -> Any:
+                response = await command(
+                    "Runtime.evaluate", {"expression": gesture_probe, "returnByValue": True, **extra}
+                )
+                return response.get("result", {}).get("result", {}).get("value")
+
+            assert await probe() is False, "a call with no gesture must not be treated as one"
+            assert await probe(userGesture=True) is True, "a call marked as a user gesture must reach the page as one"
+            # Runtime.callFunctionOn carries the same flag, and is what a client actually uses to
+            # run its own helpers against an element.
+            window = await command("Runtime.evaluate", {"expression": "window"})
+            with_gesture = await command(
+                "Runtime.callFunctionOn",
+                {
+                    "objectId": window["result"]["result"]["objectId"],
+                    "functionDeclaration": f"function() {{ return {gesture_probe}; }}",
+                    "returnByValue": True,
+                    "userGesture": True,
+                },
+            )
+            assert with_gesture["result"]["result"]["value"] is True, (
+                f"Runtime.callFunctionOn must carry the gesture too: {with_gesture}"
+            )
+        finally:
+            await client.close()
+
+
 async def testp_cdp_server_drives_a_javascript_context(lockdown: LockdownClient) -> None:
     """
     A JSContext debuggable (any process that called -[JSContext setInspectable:YES]) implements

@@ -47,6 +47,10 @@ MAX_FRAME_DESCENT = 5
 # allocated here, well clear of anything the device would produce.
 _FRAME_OWNER_NODE_IDS = itertools.count(0x60000000)
 
+# backendNodeIds minted for nodes a client asked about with DOM.describeNode, so it can name the
+# same node again later (DOM.resolveNode) - which is how it moves an element between worlds.
+_DESCRIBED_NODE_IDS = itertools.count(0x70000000)
+
 # sourceURL stamped onto the bridge's own internal evaluations (screencast offsets, synthesized
 # input, navigation) so their Debugger.scriptParsed events can be recognized and dropped instead
 # of polluting Chrome's script model. WebKit-inspector-internal scripts (its injected script
@@ -281,6 +285,9 @@ class CdpTarget:
         self._announced_frames: set[str] = set()
         # Minted backendNodeId -> the (frame, index) of the <iframe> element it stands for.
         self._frame_owner_nodes: dict[int, tuple[str, int]] = {}
+        # Minted backendNodeId -> the remote object a client was told about. WebKit has no node
+        # identity that outlives a description, so one is kept here (see _dom_describe_node).
+        self._described_nodes: dict[int, str] = {}
         # World names the client registered through Page.addScriptToEvaluateOnNewDocument. Chrome
         # creates a world of that name in every document that loads; the bridge does the same, so
         # a frame that appears later still gets the world its client expects to evaluate in.
@@ -347,6 +354,7 @@ class CdpTarget:
             "Runtime.runIfWaitingForDebugger": partial(self._simple_response, value=None),
             "Runtime.enable": self._runtime_enable,
             "Runtime.evaluate": self._runtime_evaluate,
+            "Runtime.callFunctionOn": self._runtime_call_function_on,
             "Runtime.compileScript": self._runtime_compile_script,
             "Runtime.runScript": self._runtime_run_script,
             "Runtime.getIsolateId": self._runtime_get_isolate_id,
@@ -1562,9 +1570,11 @@ class CdpTarget:
             await self._error_response(message, {"code": -32000, "message": "Node is detached from document"})
             return
         info = cast(dict[str, Any], value)
+        backend_node_id = next(_DESCRIBED_NODE_IDS)
+        self._described_nodes[backend_node_id] = cast(str, object_id)
         node: dict[str, Any] = {
             "nodeId": 0,
-            "backendNodeId": 0,
+            "backendNodeId": backend_node_id,
             "nodeType": 1,
             "nodeName": info.get("nodeName", ""),
             "localName": info.get("localName", ""),
@@ -1639,6 +1649,26 @@ class CdpTarget:
         """Resolve a node back to an object. Only the frame-owner ids minted above are handled
         here; anything else is WebKit's own and is passed through."""
         backend_node_id = message.get("params", {}).get("backendNodeId")
+        if isinstance(backend_node_id, int):
+            described = self._described_nodes.get(backend_node_id)
+            if described is not None:
+                # A client resolves a node to move it between worlds. The worlds this bridge
+                # hands out are all backed by the frame's one real context (see
+                # _page_create_isolated_world), so the node needs no moving - but it does need a
+                # handle of its own: the client releases the handle it described from, and
+                # answering with that same one hands back a reference it has already dropped.
+                fresh = await self.send_message_with_result(
+                    "Runtime.callFunctionOn",
+                    {"objectId": described, "functionDeclaration": "function() { return this; }"},
+                )
+                remote_object = fresh.get("result", {}).get("result")
+                if not isinstance(remote_object, dict) or "objectId" not in cast(dict[str, Any], remote_object):
+                    await self._error_response(message, {"code": -32000, "message": "No node with given id found"})
+                    return
+                node_object = cast(dict[str, Any], remote_object)
+                node_object.setdefault("subtype", "node")
+                await self.output_queue.put({"id": message["id"], "result": {"object": node_object}})
+                return
         owner = self._frame_owner_nodes.get(backend_node_id) if isinstance(backend_node_id, int) else None
         if owner is None:
             await self._send_message_to_target(message)
@@ -2101,6 +2131,7 @@ class CdpTarget:
         # through - refusing them would kill autocomplete. Only the eager preview (no completion
         # objectGroup) is refused.
         params = message["params"]
+        self._translate_user_gesture(params)
         if self._flat:
             # The context the frontend targets is the one synthesized in _runtime_enable, which the
             # debuggable knows nothing about; addressing it explicitly would fail the lookup. It has
@@ -2155,6 +2186,23 @@ class CdpTarget:
                 },
             })
             return
+        await self._send_message_to_target(message)
+
+    @staticmethod
+    def _translate_user_gesture(params: dict[str, Any]) -> None:
+        """Carry a client's "this is a user gesture" flag across to the name WebKit knows.
+
+        Chrome calls it `userGesture`, WebKit `emulateUserGesture`, and an unrecognized parameter
+        is simply ignored - so the call ran with no gesture behind it. That is not cosmetic: an
+        element inside a cross-origin frame cannot be focused without one, so a client's fill()
+        (which focuses the field, then types into whatever holds the focus) quietly typed
+        nowhere and left the field empty.
+        """
+        if "userGesture" in params:
+            params["emulateUserGesture"] = bool(params.pop("userGesture"))
+
+    async def _runtime_call_function_on(self, message: dict[str, Any]):
+        self._translate_user_gesture(message.setdefault("params", {}))
         await self._send_message_to_target(message)
 
     async def _runtime_compile_script(self, message: dict[str, Any]):
