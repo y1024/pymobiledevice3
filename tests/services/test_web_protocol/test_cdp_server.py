@@ -1012,6 +1012,70 @@ async def testp_cdp_server_resolves_a_node_back_to_a_handle(lockdown: LockdownCl
             await client.close()
 
 
+async def testp_cdp_server_carries_a_user_gesture_through(lockdown: LockdownClient) -> None:
+    """
+    A client marks the calls it makes on the user's behalf as a user gesture. Chrome names that
+    `userGesture` and WebKit `emulateUserGesture`, and an unrecognized parameter is ignored - so
+    every such call ran with no gesture behind it.
+
+    That is not cosmetic. Anything the platform gates behind a gesture silently did nothing,
+    including focusing an element inside a cross-origin frame - which is what a client's fill()
+    does before typing, so it typed nowhere and left the field empty while reporting success.
+    """
+    async with cdp_server_with_safari_page(lockdown) as (port, targets):
+        client = CdpWebsocketClient(port, targets[0]["id"])
+        await asyncio.wait_for(client.connect(), TIMEOUT)
+        message_ids = itertools.count(1)
+        try:
+
+            async def command(method: str, params: dict[str, Any]) -> dict[str, Any]:
+                return await client.command(next(message_ids), method, params)
+
+            await command("Page.enable", {})
+            await command("Runtime.enable", {})
+            await command("Page.navigate", {"url": "https://example.com/"})
+
+            # execCommand('copy') is refused without a user gesture and allowed with one, so it
+            # reports whether the gesture actually reached the page.
+            gesture_probe = (
+                "(function () {"
+                "  const field = document.createElement('textarea');"
+                "  field.value = 'x';"
+                "  document.body.appendChild(field);"
+                "  field.select();"
+                "  const allowed = document.execCommand('copy');"
+                "  field.remove();"
+                "  return allowed;"
+                "})()"
+            )
+
+            async def probe(**extra: Any) -> Any:
+                response = await command(
+                    "Runtime.evaluate", {"expression": gesture_probe, "returnByValue": True, **extra}
+                )
+                return response.get("result", {}).get("result", {}).get("value")
+
+            assert await probe() is False, "a call with no gesture must not be treated as one"
+            assert await probe(userGesture=True) is True, "a call marked as a user gesture must reach the page as one"
+            # Runtime.callFunctionOn carries the same flag, and is what a client actually uses to
+            # run its own helpers against an element.
+            window = await command("Runtime.evaluate", {"expression": "window"})
+            with_gesture = await command(
+                "Runtime.callFunctionOn",
+                {
+                    "objectId": window["result"]["result"]["objectId"],
+                    "functionDeclaration": f"function() {{ return {gesture_probe}; }}",
+                    "returnByValue": True,
+                    "userGesture": True,
+                },
+            )
+            assert with_gesture["result"]["result"]["value"] is True, (
+                f"Runtime.callFunctionOn must carry the gesture too: {with_gesture}"
+            )
+        finally:
+            await client.close()
+
+
 async def testp_cdp_server_drives_a_javascript_context(lockdown: LockdownClient) -> None:
     """
     A JSContext debuggable (any process that called -[JSContext setInspectable:YES]) implements

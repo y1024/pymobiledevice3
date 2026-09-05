@@ -354,6 +354,7 @@ class CdpTarget:
             "Runtime.runIfWaitingForDebugger": partial(self._simple_response, value=None),
             "Runtime.enable": self._runtime_enable,
             "Runtime.evaluate": self._runtime_evaluate,
+            "Runtime.callFunctionOn": self._runtime_call_function_on,
             "Runtime.compileScript": self._runtime_compile_script,
             "Runtime.runScript": self._runtime_run_script,
             "Runtime.getIsolateId": self._runtime_get_isolate_id,
@@ -2130,6 +2131,7 @@ class CdpTarget:
         # through - refusing them would kill autocomplete. Only the eager preview (no completion
         # objectGroup) is refused.
         params = message["params"]
+        self._translate_user_gesture(params)
         if self._flat:
             # The context the frontend targets is the one synthesized in _runtime_enable, which the
             # debuggable knows nothing about; addressing it explicitly would fail the lookup. It has
@@ -2184,6 +2186,23 @@ class CdpTarget:
                 },
             })
             return
+        await self._send_message_to_target(message)
+
+    @staticmethod
+    def _translate_user_gesture(params: dict[str, Any]) -> None:
+        """Carry a client's "this is a user gesture" flag across to the name WebKit knows.
+
+        Chrome calls it `userGesture`, WebKit `emulateUserGesture`, and an unrecognized parameter
+        is simply ignored - so the call ran with no gesture behind it. That is not cosmetic: an
+        element inside a cross-origin frame cannot be focused without one, so a client's fill()
+        (which focuses the field, then types into whatever holds the focus) quietly typed
+        nowhere and left the field empty.
+        """
+        if "userGesture" in params:
+            params["emulateUserGesture"] = bool(params.pop("userGesture"))
+
+    async def _runtime_call_function_on(self, message: dict[str, Any]):
+        self._translate_user_gesture(message.setdefault("params", {}))
         await self._send_message_to_target(message)
 
     async def _runtime_compile_script(self, message: dict[str, Any]):
