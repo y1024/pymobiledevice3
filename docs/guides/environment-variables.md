@@ -13,6 +13,7 @@ Each one is a default: the matching command-line option always wins.
 | Variable | Value | Effect |
 | --- | --- | --- |
 | `PYMOBILEDEVICE3_UDID` | device UDID | Default for `--udid` — the device every command targets. |
+| `PYMOBILEDEVICE3_RECONNECT_ANY` | any non-empty value | With `--reconnect`: after a mid-command disconnect, reconnect to the **first available** device even when its UDID differs from the device the command originally targeted. A warning is printed and the re-invocation targets the newly connected device. |
 | `PYMOBILEDEVICE3_USBMUX` | unix socket path or `HOST:PORT` | Default for `--usbmux` — where `usbmuxd` is listening. |
 | `USBMUXD_SOCKET_ADDRESS` | unix socket path or `HOST:PORT` | Same as above; honored for compatibility with `libimobiledevice`. |
 
