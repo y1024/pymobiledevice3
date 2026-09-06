@@ -140,12 +140,12 @@ Attach to Node.js/Chrome**, host `127.0.0.1`, port `9222`, attach to *Chrome or
 Node.js > 6.3 started with --inspect*. Starting that configuration in Debug opens a
 **Choose Page to Debug** list with every inspectable page and JSContext on the device;
 pick one and the session attaches to it. Breakpoints and the debug console work on a
-Safari page; the bridge answers WebStorm's `Debugger.setSkipAllPauses` with an error
-WebKit does not know the method, which WebStorm tolerates.
+Safari page. WebStorm sends `Debugger.setSkipAllPauses` on attach, which WebKit does not
+have; the bridge translates it into deactivating breakpoints and `debugger` statements.
 
 WebStorm builds a Node-style target out of a `node` entry's `url`, so JSContexts are
-listed under a `jscontext://<bundle id>/<pid>/<page>` URL. An empty one made WebStorm
-fail with "Malformed URL" as soon as a JSContext was picked.
+listed under a `jscontext://<bundle id>/<pid>/<page>` URL (WebStorm rejects a `node`
+entry with an empty URL as malformed).
 
 ## Test automation (Playwright, Puppeteer)
 
@@ -249,9 +249,14 @@ already existed when a client attached keep running, as in Safari.
 
 - WebKit allows a single inspector session per page, so two *separate* debuggers
   cannot hold the same tab: Chrome DevTools and VS Code can debug different tabs
-  concurrently, but not the same one. A page already held by another debugger is
-  skipped after a short wait — detach the other client first. A single client may
-  open as many CDP sessions onto a page as it likes (Playwright does this when a
-  script also opens a raw `newCDPSession`); those share the one underlying session.
+  concurrently, but not the same one. Opening a page from the landing page takes it
+  over from whichever session of this bridge holds it (a DevTools tab left open
+  elsewhere, for example), which is then disconnected. Browser-level clients (VS Code,
+  Playwright) do not take pages over: a page held by another session is skipped after
+  a short wait. A page held over a *different* Web Inspector connection (Safari's own
+  Web Inspector, a second `pymobiledevice3`) cannot be taken; the bridge logs which
+  connection holds it — detach that client first. A single client may open as many CDP
+  sessions onto a page as it likes (Playwright does this when a script also opens a raw
+  `newCDPSession`); those share the one underlying session.
 - The page listing is polled as a fallback, so a tab the device did not announce on
   its own is still discovered (and auto-attached) within a couple of seconds.
