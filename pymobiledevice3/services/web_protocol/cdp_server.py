@@ -1,4 +1,5 @@
 import asyncio
+import importlib.resources
 import json
 import shutil
 import subprocess
@@ -18,6 +19,7 @@ from fastapi import FastAPI, Request, WebSocket
 from fastapi.logger import logger
 from fastapi.responses import HTMLResponse, Response
 
+import pymobiledevice3.resources
 from pymobiledevice3.services.web_protocol.cdp_browser import (
     HELD_TARGETS,
     PAGE_HANDOVER_TIMEOUT,
@@ -90,6 +92,9 @@ NO_TARGETS_MESSAGE_HTML = f'<p class="empty">{NO_TARGETS_MESSAGE}</p>'
 # polling while it is not the visible tab.
 INDEX_POLL_INTERVAL_MS = 750
 
+# The project logo, served as the landing page's favicon and header image (see serve_logo).
+LOGO_PNG = (importlib.resources.files(pymobiledevice3.resources) / "webinspector" / "logo.png").read_bytes()
+
 # Label of the landing page's pause-on-launch switch (see pause_new_targets endpoints).
 PAUSE_NEW_TARGETS_LABEL = "Pause new JSContexts on launch"
 
@@ -114,6 +119,7 @@ body {
 }
 main { max-width: 760px; margin: 0 auto; padding: 18px 16px 32px; }
 header { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 20px; margin-bottom: 12px; }
+.logo { height: 40px; width: auto; }
 h1 { font-size: 17px; font-weight: 600; margin: 0; flex: 1 1 auto; }
 h1 small { display: block; font-size: 12px; font-weight: 400; color: var(--muted); }
 .toggle { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; font-size: 13px; }
@@ -566,8 +572,10 @@ async def index(request: Request) -> HTMLResponse:
         "<!doctype html><meta charset=utf-8>"
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
         "<title>pymobiledevice3 Web Inspector</title>"
+        '<link rel="icon" type="image/png" href="/logo.png">'
         f"<style>{INDEX_STYLE}</style>"
         "<main><header>"
+        '<img class="logo" src="/logo.png" alt="">'
         "<h1>Web Inspector<small>pymobiledevice3 &middot; inspectable pages and JSContexts on the device</small></h1>"
         f'<label class="toggle"><input type="checkbox" id="pause-new-targets"{checked}>'
         f'<span class="switch"></span>{PAUSE_NEW_TARGETS_LABEL}</label>'
@@ -616,6 +624,13 @@ def targets_html(inspector: WebinspectorService, host: str) -> str:
     if not items:
         return NO_TARGETS_MESSAGE_HTML
     return '<ul class="targets">' + "".join(items) + "</ul>"
+
+
+@app.get("/logo.png")
+@app.get("/favicon.ico")
+async def serve_logo() -> Response:
+    """The project logo; /favicon.ico as well, for browsers that ask for the default icon path."""
+    return Response(content=LOGO_PNG, media_type="image/png")
 
 
 @app.get("/devtools/{path:path}")

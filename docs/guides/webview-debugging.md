@@ -37,6 +37,13 @@ The listing keeps itself current: a tab opened, closed or navigated on the devic
 appears there within a couple of seconds, with no reload. Leave it open in a
 background tab and it stops polling until you come back to it.
 
+The device screen (toggle the device toolbar) takes the keyboard: characters type
+into the focused field, held keys repeat, Cmd/Ctrl-A selects all, the arrow keys,
+Home and End move the caret (Shift extends the selection, Alt moves by word,
+Cmd by line), Backspace and Delete edit, Enter submits. The page's own `keydown` and
+`keyup` listeners see every key, and one that calls `preventDefault()` keeps its
+shortcut, as in a browser. Clipboard shortcuts (Cmd-C/V/X) are not relayed.
+
 ## JavaScript contexts
 
 A process that made a bare `JSContext` inspectable is listed alongside the web pages,
