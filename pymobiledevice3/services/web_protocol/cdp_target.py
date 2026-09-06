@@ -3,6 +3,7 @@ import hashlib
 import itertools
 import json
 import logging
+import re
 from collections.abc import Awaitable
 from datetime import datetime
 from functools import partial
@@ -239,9 +240,20 @@ DEBUGGER_PAUSED_REASON = {
     "exception": "exception",
     "assert": "assert",
     "CSPViolation": "CSPViolation",
-    "DebuggerStatement": "debugCommand",
-    "Breakpoint": "instrumentation",
-    "PauseOnNextStatement": "instrumentation",
+    # A `debugger;` statement. V8/Chrome report this as "other", and that is what editors treat
+    # as a genuine suspend to hold. "debugCommand" is Chrome's reason for a pause the client
+    # itself requested via Debugger.pause; WebStorm, seeing it without having asked, took the
+    # pause for spurious and resumed on its own - so `debugger` never stopped it on a JSContext.
+    "DebuggerStatement": "other",
+    # A hit on a source breakpoint. V8/Chrome report this as "other" with hitBreakpoints set;
+    # "instrumentation" is Chrome's reason for its instrumentation breakpoints (DOM/event/...),
+    # which carry data an editor looks for and, not finding, discards the pause - so a breakpoint
+    # a user set on a JSContext line was reached but never surfaced.
+    "Breakpoint": "other",
+    # Chrome's reason for its own pause button. "instrumentation" is reserved for the frontend's
+    # instrumentation breakpoints, which carry breakpoint data; without it the frontend drops
+    # the pause silently and stays at "Not paused".
+    "PauseOnNextStatement": "other",
     "Microtask": "other",
     "BlackboxedScript": "other",
     "other": "other",
@@ -337,6 +349,7 @@ class CdpTarget:
             "Emulation.setEmitTouchEventsForMouse": partial(self._simple_response, value=None),
             "Debugger.setAsyncCallStackDepth": partial(self._simple_response, value=True),
             "Debugger.enable": self._debugger_enable,
+            "Debugger.setSkipAllPauses": self._debugger_set_skip_all_pauses,
             "Debugger.setBreakpointsActive": self._debugger_set_breakpoints_active,
             "Debugger.setBlackboxPatterns": self._debugger_set_blackbox_patterns,
             "Debugger.setBreakpointByUrl": self._debugger_set_breakpoint_by_url,
@@ -351,7 +364,7 @@ class CdpTarget:
             # Overlay is absent in WebKit; only highlightNode is worth translating, the rest are
             # acknowledged by the NOOP_ABSENT_DOMAINS fallback in _input_loop.
             "Overlay.highlightNode": self._overlay_highlight_node,
-            "Runtime.runIfWaitingForDebugger": partial(self._simple_response, value=None),
+            "Runtime.runIfWaitingForDebugger": self._runtime_run_if_waiting_for_debugger,
             "Runtime.enable": self._runtime_enable,
             "Runtime.evaluate": self._runtime_evaluate,
             "Runtime.callFunctionOn": self._runtime_call_function_on,
@@ -455,6 +468,10 @@ class CdpTarget:
         # scriptId -> url, from Debugger.scriptParsed; used to fill the `url` WebKit omits from the
         # callFrames of Debugger.paused (Chrome's CallFrame requires it).
         self._script_id_to_url: dict[str, str] = {}
+        # For a flat JSContext: the synthetic URL handed to the frontend for a URL-less script ->
+        # the script's id. Lets a URL breakpoint (how editors set breakpoints) be turned into a
+        # scriptId-location breakpoint, the only kind that binds on a URL-less script.
+        self._flat_script_url_to_id: dict[str, str] = {}
         self._eval_side_effect_id = 0
         self._default_execution_id = 0
         self._last_console_api_call: Optional[dict[str, Any]] = None
@@ -488,6 +505,27 @@ class CdpTarget:
         self._setup_sent_targets: set[str] = {target_id}
         # Targets announced as pages - the only kind this session talks to (see _target_created).
         self._page_targets: set[str] = {target_id}
+        # The debuggable was attached before it ran (an automatic-inspection candidate) and the
+        # application is blocked until the frontend reports itself initialized. Released by the
+        # client's Runtime.runIfWaitingForDebugger, or on close.
+        self.waiting_for_debugger = False
+        # Stop the debuggable on its first statement once attached (Safari's "Automatically
+        # Pause Connecting to JSContexts"). A held JSContext is paused by WebKit itself on
+        # release (the socket was set up with WIRAutomaticallyPause); anything else - a page,
+        # the target a process swap creates - is paused by the bridge as soon as its debugger is
+        # enabled (see _debugger_enable and _target_created).
+        self.pause_on_start = False
+        # Hold the page target a cross-site navigation creates until its debugger setup has been
+        # replayed (WebKit's Target.setPauseOnStart); see hold_new_targets.
+        self.hold_navigations = False
+        # Targets the bridge already asked to pause, so each is stopped once.
+        self._paused_targets: set[str] = set()
+        # What the target emitted while the bridge held it with no frontend attached (see
+        # start_holding): handed to the frontend that adopts it once its debugger is on.
+        self.held_events: list[dict[str, Any]] = []
+        self._holding_task: Optional[asyncio.Task[None]] = None
+        # id of the adopting frontend's Debugger.enable; the held events follow its response.
+        self._replay_after_id: Optional[int] = None
 
     def next_internal_id(self) -> int:
         """
@@ -535,11 +573,15 @@ class CdpTarget:
                     frame_d[key] = self._to_client_frame_id(frame_d[key])
 
     @classmethod
-    async def create(cls, protocol: SessionProtocol) -> "CdpTarget":
+    async def create(cls, protocol: SessionProtocol, automatically_pause: bool = False) -> "CdpTarget":
         """
         :param pymobiledevice3.services.web_protocol.session_protocol.SessionProtocol protocol: Session protocol.
+        :param automatically_pause: Have WebKit pause the debuggable on its next statement once the
+            frontend is initialized (see WebinspectorService.setup_inspector_socket).
         """
-        await protocol.inspector.setup_inspector_socket(protocol.id_, protocol.app.id_, protocol.page.id_)
+        await protocol.inspector.setup_inspector_socket(
+            protocol.id_, protocol.app.id_, protocol.page.id_, automatically_pause=automatically_pause
+        )
         if protocol.page.type_ == WirTypes.JAVASCRIPT:
             # A JSContext debuggable has no Target domain, so it announces nothing on attach and
             # there is only ever the one target - synthesize its id instead of waiting forever.
@@ -560,6 +602,67 @@ class CdpTarget:
         # Chrome's schema requires (type/title/url/attached) and crashes the frontend's SDK.
         return cls(protocol, target_id)
 
+    async def hold_new_targets(self) -> None:
+        """Ask WebKit to hold the page target a cross-site navigation creates until it is resumed.
+
+        The one creation-time hold WebKit offers for pages: a WKWebView's page runs from the
+        moment it exists, but a navigation that swaps processes announces its provisional target
+        first, and with Target.setPauseOnStart that target waits for Target.resume before its
+        load commits. The bridge resumes it right after replaying the frontend's setup (see
+        _target_created), so breakpoints reach the new process ahead of its first script.
+        """
+        if self.hold_navigations:
+            return
+        self.hold_navigations = True
+        if not self._flat:
+            await self.protocol.send_command("Target.setPauseOnStart", pauseOnStart=True)
+
+    async def release_debugger(self) -> None:
+        """Let a debuggable attached before it ran start running.
+
+        WebKit blocks the thread creating an automatic-inspection candidate until the frontend
+        sends Inspector.initialized (or ten seconds pass); Chrome clients express the same step
+        as Runtime.runIfWaitingForDebugger. Nothing to do for a target that was not held.
+        """
+        if not self.waiting_for_debugger:
+            return
+        self.waiting_for_debugger = False
+        await self._send_message_to_target(
+            {"id": self.next_internal_id(), "method": "Inspector.initialized", "params": {}}, record=False
+        )
+
+    async def enable_debugger(self) -> None:
+        """Turn the debugger on on the bridge's own behalf (with the same extras a frontend's
+        Debugger.enable gets), before any frontend is attached."""
+        await self._debugger_enable({"id": self.next_internal_id(), "method": "Debugger.enable", "params": {}})
+
+    def start_holding(self) -> None:
+        """Keep the target alive with no frontend attached: whatever it emits meanwhile - the
+        scripts it parsed, the pause it stopped at - is kept for the frontend that adopts it."""
+
+        async def collect() -> None:
+            while True:
+                self.held_events.append(await self.output_queue.get())
+
+        self._holding_task = asyncio.create_task(collect())
+
+    def adopt(self) -> None:
+        """Hand a held target to a frontend. What it missed is replayed once it enables the
+        debugger (see _debugger_enable): a pause only means something to a debugger that is on,
+        and that is the order a fresh backend would have produced."""
+        if self._holding_task is not None:
+            self._holding_task.cancel()
+            self._holding_task = None
+
+    async def _pause_target(self, target_id: str) -> None:
+        """Stop a target on its next statement, once, if the client's debugger is on."""
+        if target_id in self._paused_targets or "Debugger.enable" not in self._setup_messages:
+            return
+        self._paused_targets.add(target_id)
+        await self._send_message_to_target(
+            {"id": self.next_internal_id(), "method": "Debugger.pause", "params": {}}, target_id=target_id, record=False
+        )
+
     async def close(self) -> None:
         """
         Stop the queue-consumer tasks and any running screencast, and tear down the WIR socket.
@@ -567,6 +670,12 @@ class CdpTarget:
         if self.screencast is not None:
             await self.screencast.stop()
             self.screencast = None
+        # A held debuggable must not outlive its debugger: release it before the socket goes.
+        await self.release_debugger()
+        if self._holding_task is not None:
+            self._holding_task.cancel()
+            await asyncio.gather(self._holding_task, return_exceptions=True)
+            self._holding_task = None
         for task in (self._input_task, self._receiving_task, *self._background_tasks):
             task.cancel()
         await asyncio.gather(self._input_task, self._receiving_task, *self._background_tasks, return_exceptions=True)
@@ -1997,6 +2106,9 @@ class CdpTarget:
         await self._send_message_to_target(message)
 
     async def _debugger_enable(self, message: dict[str, Any]):
+        if self.held_events and self._holding_task is None:
+            # An adopting frontend: what the target emitted while held follows this response.
+            self._replay_after_id = message["id"]
         await self._send_message_to_target(message)
         # Two WebKit quirks conspire to make the debugger never stop, and Chrome's frontend papers
         # over neither because its own backend behaves differently:
@@ -2018,6 +2130,32 @@ class CdpTarget:
             "method": "Debugger.setPauseOnDebuggerStatements",
             "params": {"enabled": True},
         })
+        if self.pause_on_start and not self.waiting_for_debugger:
+            # Pause mode on a debuggable that could not be held before it ran: stop it on its
+            # next statement now that the client's debugger is on. A held one is paused by
+            # WebKit itself when released.
+            await self._pause_target(self.target_id)
+
+    async def _debugger_set_skip_all_pauses(self, message: dict[str, Any]) -> None:
+        # WebKit has no setSkipAllPauses (WebStorm sends it on attach); skipping every pause is
+        # what deactivating breakpoints and debugger statements amounts to, and un-skipping is
+        # the state _debugger_enable establishes. Both are replayed onto new targets.
+        skip = bool(message.get("params", {}).get("skip"))
+        await self._send_message_to_target({
+            "id": self.next_internal_id(),
+            "method": "Debugger.setBreakpointsActive",
+            "params": {"active": not skip},
+        })
+        await self._send_message_to_target({
+            "id": self.next_internal_id(),
+            "method": "Debugger.setPauseOnDebuggerStatements",
+            "params": {"enabled": not skip},
+        })
+        await self._result_response(message, {})
+
+    async def _runtime_run_if_waiting_for_debugger(self, message: dict[str, Any]) -> None:
+        await self.release_debugger()
+        await self._simple_response(message, None)
 
     async def _debugger_set_breakpoints_active(self, message: dict[str, Any]):
         # Chrome's "Deactivate breakpoints" toggle also suppresses `debugger;` statements; mirror
@@ -2038,10 +2176,46 @@ class CdpTarget:
         await self._simple_response(message, None)
 
     async def _debugger_set_breakpoint_by_url(self, message: dict[str, Any]):
-        condition = message["params"].pop("condition", "")
+        params = message["params"]
+        if self._flat:
+            script_id = self._flat_breakpoint_script(params)
+            if script_id is not None:
+                # A URL breakpoint does not bind on a URL-less JSContext script; set it by the
+                # script's location instead - the only kind that binds - and answer the frontend
+                # in the shape it expects from setBreakpointByUrl.
+                location: dict[str, Any] = {"scriptId": script_id, "lineNumber": params.get("lineNumber", 0)}
+                if "columnNumber" in params:
+                    location["columnNumber"] = params["columnNumber"]
+                set_params: dict[str, Any] = {"location": location}
+                if params.get("condition"):
+                    set_params["options"] = {"condition": params["condition"]}
+                response = await self.send_message_with_result("Debugger.setBreakpoint", set_params)
+                result = response.get("result", {})
+                breakpoint_id = result.get("breakpointId") or f"url:{params.get('url')}"
+                locations = [result["actualLocation"]] if "actualLocation" in result else []
+                await self._result_response(message, {"breakpointId": breakpoint_id, "locations": locations})
+                return
+        condition = params.pop("condition", "")
         if condition:
-            message["params"]["options"]["condition"] = condition
+            params["options"]["condition"] = condition
         await self._send_message_to_target(message)
+
+    def _flat_breakpoint_script(self, params: dict[str, Any]) -> Optional[str]:
+        """The JSContext script a URL breakpoint targets: by exact synthetic URL, or by a urlRegex
+        that matches one. None when it targets no known script (then it is forwarded unchanged)."""
+        url = params.get("url")
+        if url and url in self._flat_script_url_to_id:
+            return self._flat_script_url_to_id[url]
+        url_regex = params.get("urlRegex")
+        if url_regex:
+            try:
+                pattern = re.compile(url_regex)
+            except re.error:
+                return None
+            for known_url, script_id in self._flat_script_url_to_id.items():
+                if pattern.search(known_url):
+                    return script_id
+        return None
 
     async def _domdebugger_get_event_listeners(self, message: dict[str, Any]):
         node = {"nodeId": await self.object_id_to_node_id(message["params"]["objectId"])}
@@ -2556,6 +2730,12 @@ class CdpTarget:
         # Network/Page/Console/Debugger event ever arrives again after a process swap and the
         # session appears dead after a couple of link clicks.
         await self._send_setup_to_target(new_target_id)
+        if target_info.get("isPaused", False):
+            # Held by Target.setPauseOnStart (see hold_new_targets) - its setup is in place now,
+            # so let its load commit; in pause mode, stopped on its first statement.
+            if self.pause_on_start:
+                await self._pause_target(new_target_id)
+            await self.protocol.send_command("Target.resume", targetId=new_target_id)
         await self.output_queue.put({
             "method": "Target.targetInfoChanged",
             "params": {
@@ -2670,11 +2850,33 @@ class CdpTarget:
             # Expected protocol-level errors (e.g. element-only DOM queries on text nodes) are
             # already delivered to the frontend, which copes; don't shout about them here.
             logger.debug(f"Target error response: {message}")
+            data = message["error"].get("data")
+            if data is not None and not isinstance(data, str):
+                # WebKit lists the underlying errors under `data`; Chrome's protocol types it as
+                # a string, and WebStorm's reader gives up on the whole response otherwise
+                # ("Expected a string but was BEGIN_ARRAY") - one per domain a JSContext lacks.
+                entries = cast(list[Any], data) if isinstance(data, list) else []
+                details = [
+                    str(cast(dict[str, Any], entry).get("message", "")) for entry in entries if isinstance(entry, dict)
+                ]
+                message["error"]["data"] = "; ".join(detail for detail in details if detail) or json.dumps(data)
+            if "id" in message and str(message["error"].get("message", "")).endswith("domain already enabled"):
+                # Enabled before the frontend asked - by the bridge holding the target, or by WebKit
+                # itself when it paused a released context. Chrome's backend treats a repeated
+                # enable as a no-op, and the frontend gives up on the domain over an error.
+                message = {"id": message["id"], "result": {}}
         if "id" in message:
             self._pending_requests.pop(message["id"], None)
             if message["id"] < 0:
                 # Response to a bridge-internal request (setup replay or an abandoned wait);
                 # forwarding it would hand the frontend an id it never issued.
+                return
+            if message["id"] == self._replay_after_id:
+                self._replay_after_id = None
+                await self.output_queue.put(message)
+                for event in self.held_events:
+                    await self.output_queue.put(event)
+                self.held_events.clear()
                 return
         method = message.get("method", "")
         if method in WEBKIT_ONLY_EVENTS:
@@ -2710,6 +2912,14 @@ class CdpTarget:
         if any(marker in source for marker in WEBKIT_INTERNAL_SCRIPT_MARKERS):
             return
         script_id = params.get("scriptId")
+        if not source and self._flat and script_id is not None:
+            # A JSContext's own scripts carry no URL (nothing gave them a sourceURL). An editor
+            # sets a breakpoint by URL, which cannot match an empty one, so the breakpoint never
+            # binds. Give the script a stable synthetic URL so it is addressable, and translate
+            # the URL breakpoint back to this script (see _debugger_set_breakpoint_by_url).
+            source = f"jscontext:///{script_id}.js"
+            params["url"] = source
+            self._flat_script_url_to_id[source] = script_id
         if script_id is not None:
             self._script_id_to_url[script_id] = source
         await self.output_queue.put(message)

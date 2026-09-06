@@ -1536,7 +1536,8 @@ def test_landing_page_links_each_kind_to_its_own_frontend() -> None:
     html = targets_html(inspector, "127.0.0.1:9222")
 
     assert '<a href="/devtools/inspector.html?ws=127.0.0.1:9222/devtools/page/PID:1:1">Example</a>' in html
-    assert '<a href="/devtools/js_app.html?ws=127.0.0.1:9222/devtools/page/PID:2:1">myapp (2): JSContext</a>' in html
+    # Every JSContext of a process is titled "JSContext"; the context number tells them apart.
+    assert '<a href="/devtools/js_app.html?ws=127.0.0.1:9222/devtools/page/PID:2:1">myapp (2): JSContext #1</a>' in html
 
 
 def test_landing_page_escapes_titles_from_the_device() -> None:
