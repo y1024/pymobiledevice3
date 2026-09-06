@@ -26,6 +26,9 @@ WIR_RESULT_TIMEOUT = 5
 # timeout so a still-dead target only briefly re-pauses the receive loop.
 UNRESPONSIVE_REPROBE_INTERVAL = 2.0
 UNRESPONSIVE_PROBE_TIMEOUT = 1.5
+# How long an in-page key handler's reply may take before the bridge nudges the page (see
+# CdpTarget._evaluate_key_handler). Typical replies arrive within ~10 ms.
+KEY_HANDLER_WAKE_DELAY = 0.05
 
 # A navigation that commits in a new process destroys the target the bridge is talking to, and
 # WebKit never answers what was in flight to it. That is exactly when Chrome's frontend asks for
@@ -260,6 +263,115 @@ DEBUGGER_PAUSED_REASON = {
 }
 
 
+# In-page handler for a keyDown the bridge received (see CdpTarget._editing_key_event). Dispatches
+# the keydown to the focused element and, unless the page prevented its default, performs the key's
+# editing action on a field: select-all (Cmd/Ctrl-A), caret movement by character, word (Alt) or
+# line (Cmd, Home/End) with Shift extending the selection, Backspace and Delete - replacing the
+# selection when there is one, and honouring beforeinput. Up/Down move to the ends of a single-line
+# input only; in a textarea they are left alone. Returns "prevented", "handled" or "none".
+KEY_DOWN_JS = """(function (k) {
+  const el = document.activeElement || document.body;
+  const event = new KeyboardEvent('keydown', {key: k.key, code: k.code, altKey: k.alt, ctrlKey: k.ctrl,
+      metaKey: k.meta, shiftKey: k.shift, repeat: k.repeat, bubbles: true, cancelable: true});
+  if (k.keyCode) {
+    for (const name of ['keyCode', 'which']) { Object.defineProperty(event, name, {get: () => k.keyCode}); }
+  }
+  if (!el.dispatchEvent(event)) { return 'prevented'; }
+  const tag = el.tagName ? el.tagName.toLowerCase() : '';
+  const isField = (tag === 'input' || tag === 'textarea') && !el.disabled && !el.readOnly;
+  if ((k.meta || k.ctrl) && k.key.toLowerCase() === 'a') {
+    if (isField) { el.select(); }
+    else if (el.isContentEditable) { document.execCommand('selectAll'); }
+    else { document.getSelection().selectAllChildren(document.body); }
+    return 'handled';
+  }
+  const fire = (type, inputType) => el.dispatchEvent(
+      new InputEvent(type, {bubbles: true, cancelable: type === 'beforeinput', inputType: inputType}));
+  if (el.isContentEditable) {
+    const selection = document.getSelection();
+    const alter = k.shift ? 'extend' : 'move';
+    switch (k.key) {
+      case 'ArrowLeft': case 'ArrowRight':
+        selection.modify(alter, k.key === 'ArrowLeft' ? 'backward' : 'forward',
+            k.meta ? 'lineboundary' : k.alt ? 'word' : 'character');
+        return 'handled';
+      case 'Home': case 'End':
+        selection.modify(alter, k.key === 'Home' ? 'backward' : 'forward', 'lineboundary');
+        return 'handled';
+      case 'Backspace':
+        if (fire('beforeinput', 'deleteContentBackward')) { document.execCommand('delete'); }
+        return 'handled';
+      case 'Delete':
+        if (fire('beforeinput', 'deleteContentForward')) { document.execCommand('forwardDelete'); }
+        return 'handled';
+    }
+    return 'none';
+  }
+  if (!isField) { return 'none'; }
+  const value = el.value || '';
+  let start = el.selectionStart, end = el.selectionEnd;
+  if (start === null || start === undefined) { start = end = value.length; }
+  const backward = el.selectionDirection === 'backward';
+  const anchor = backward ? end : start, focus = backward ? start : end;
+  const space = (c) => /\\s/.test(c);
+  const wordLeft = (pos) => { while (pos > 0 && space(value[pos - 1])) { pos--; }
+                             while (pos > 0 && !space(value[pos - 1])) { pos--; } return pos; };
+  const wordRight = (pos) => { while (pos < value.length && space(value[pos])) { pos++; }
+                              while (pos < value.length && !space(value[pos])) { pos++; } return pos; };
+  const lineStart = (pos) => value.lastIndexOf('\\n', pos - 1) + 1;
+  const lineEnd = (pos) => { const i = value.indexOf('\\n', pos); return i === -1 ? value.length : i; };
+  const setRange = (a, b, direction) => { try { el.setSelectionRange(a, b, direction); } catch (e) {} };
+  let target = null;
+  switch (k.key) {
+    case 'ArrowLeft':
+      target = k.meta ? lineStart(focus) : k.alt ? wordLeft(focus)
+          : (!k.shift && start !== end) ? start : Math.max(0, focus - 1);
+      break;
+    case 'ArrowRight':
+      target = k.meta ? lineEnd(focus) : k.alt ? wordRight(focus)
+          : (!k.shift && start !== end) ? end : Math.min(value.length, focus + 1);
+      break;
+    case 'Home': target = lineStart(focus); break;
+    case 'End': target = lineEnd(focus); break;
+    case 'ArrowUp': if (tag === 'input') { target = 0; } break;
+    case 'ArrowDown': if (tag === 'input') { target = value.length; } break;
+  }
+  if (target !== null) {
+    if (k.shift) { setRange(Math.min(anchor, target), Math.max(anchor, target), target < anchor ? 'backward' : 'forward'); }
+    else { setRange(target, target, 'none'); }
+    return 'handled';
+  }
+  if (k.key !== 'Backspace' && k.key !== 'Delete') { return 'none'; }
+  let from = start, to = end;
+  if (start === end) {
+    if (k.key === 'Backspace') { from = k.meta ? lineStart(start) : k.alt ? wordLeft(start) : Math.max(0, start - 1); }
+    else { to = k.meta ? lineEnd(end) : k.alt ? wordRight(end) : Math.min(value.length, end + 1); }
+  }
+  if (from === to) { return 'handled'; }
+  const inputType = k.key === 'Backspace' ? 'deleteContentBackward' : 'deleteContentForward';
+  if (!fire('beforeinput', inputType)) { return 'handled'; }
+  const proto = tag === 'textarea' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+  const next = value.slice(0, from) + value.slice(to);
+  if (descriptor && descriptor.set) { descriptor.set.call(el, next); } else { el.value = next; }
+  setRange(from, from, 'none');
+  fire('input', inputType);
+  return 'handled';
+})"""
+
+# In-page handler for a keyUp: the matching keyup event for the page's listeners.
+KEY_UP_JS = """(function (k) {
+  const el = document.activeElement || document.body;
+  const event = new KeyboardEvent('keyup', {key: k.key, code: k.code, altKey: k.alt, ctrlKey: k.ctrl,
+      metaKey: k.meta, shiftKey: k.shift, bubbles: true, cancelable: true});
+  if (k.keyCode) {
+    for (const name of ['keyCode', 'which']) { Object.defineProperty(event, name, {get: () => k.keyCode}); }
+  }
+  el.dispatchEvent(event);
+  return 'handled';
+})"""
+
+
 class CdpTarget:
     def __init__(self, protocol: SessionProtocol, target_id: str):
         """
@@ -481,6 +593,10 @@ class CdpTarget:
         # Text a keyDown said it would produce, held until it is known whether the client also
         # sends the "char" event that classically carried it (see _input_dispatch_key_event).
         self._pending_key_text: Optional[str] = None
+        # Whether the page's own keydown listener prevented the default of the key currently held,
+        # and the execution context its keydown was dispatched in (see _input_dispatch_key_event).
+        self._key_default_prevented = False
+        self._key_context: Optional[int] = None
         # execution-context uniqueIds already announced to the frontend, to drop duplicate
         # Runtime.executionContextCreated events (WebKit re-announces contexts) that would
         # otherwise corrupt Chrome's RuntimeModel.
@@ -2601,7 +2717,49 @@ class CdpTarget:
 
     async def _type_text(self, text: str) -> None:
         """Type into whichever document holds the focus (see _focused_context)."""
-        await self._evaluate_json_in(await self._focused_context(), self._insert_text_js(text))
+        await self._type_text_in(await self._focused_context(), text)
+
+    async def _type_text_in(self, context_id: Optional[int], text: str) -> None:
+        await self._evaluate_key_handler(context_id, self._insert_text_js(text))
+
+    async def _evaluate_key_handler(self, context_id: Optional[int], expression: str) -> Optional[Any]:
+        """_evaluate_json_in for the in-page key handlers, nudging the page when its reply is late.
+
+        WebKit on iOS sometimes holds the reply to an evaluation that edits the focused field
+        (a Backspace or a caret move) until the *next* message reaches the page: the handler
+        itself has long finished - the page goes on to emit events - but its result only
+        arrives right after whatever is sent next. Observed on iOS 26 with the very same
+        expression answering instantly most of the time, so it is a wake-up problem on the
+        device, not the script. Left alone, the wait ran out, the target was declared
+        unresponsive and every following key was skipped. Sending a trivial evaluation as
+        soon as the reply is late frees it within milliseconds; nobody waits for the nudge's
+        own reply, and a reply to an internal id nobody waits for is dropped on arrival.
+        """
+        pending = asyncio.ensure_future(self._evaluate_json_in(context_id, expression))
+        done, _ = await asyncio.wait({pending}, timeout=KEY_HANDLER_WAKE_DELAY)
+        if not done:
+            await self._send_message_to_target({
+                "id": self.next_internal_id(),
+                "method": "Runtime.evaluate",
+                "params": {"expression": "0"},
+            })
+        return await pending
+
+    @staticmethod
+    def _key_event_init(params: dict[str, Any]) -> str:
+        """The JSON the in-page key handlers take: the key and its modifiers, decoded from CDP's
+        modifier bitmask (1 Alt, 2 Ctrl, 4 Meta, 8 Shift)."""
+        modifiers = params.get("modifiers") or 0
+        return json.dumps({
+            "key": params.get("key", ""),
+            "code": params.get("code", ""),
+            "alt": bool(modifiers & 1),
+            "ctrl": bool(modifiers & 2),
+            "meta": bool(modifiers & 4),
+            "shift": bool(modifiers & 8),
+            "repeat": bool(params.get("autoRepeat", False)),
+            "keyCode": params.get("windowsVirtualKeyCode") or 0,
+        })
 
     @staticmethod
     def _printable_key_text(params: dict[str, Any]) -> Optional[str]:
@@ -2619,36 +2777,10 @@ class CdpTarget:
         params = message["params"]
         key = params["key"]
         type_ = params["type"]
-        # Typing arrives in two shapes. DevTools sends keyDown, then a "char" event carrying the
-        # character, then keyUp; Playwright never sends "char" at all and puts the character in
-        # keyDown's own text field, which used to type nothing at all - silently, so a filled-in
-        # form stayed empty with every call reporting success. Take the character from whichever
-        # event carries it, and type it exactly once: remember what a keyDown promised, let a
-        # "char" supersede it, and fall back to typing it on keyUp when no "char" follows.
-        if type_ in ("keyDown", "rawKeyDown") and key not in ("Enter", "Backspace"):
-            self._pending_key_text = self._printable_key_text(params)
-            await self._simple_response(message, None)
+        if key != "Enter":
+            await self._editing_key_event(message)
             return
-        if type_ == "keyUp" and key not in ("Enter", "Backspace"):
-            pending, self._pending_key_text = self._pending_key_text, None
-            if pending is not None:
-                await self._type_text(pending)
-            await self._simple_response(message, None)
-            return
-        if type_ == "char" and key not in ("Enter", "Backspace"):
-            self._pending_key_text = None
-            text = self._printable_key_text(params)
-            if text is not None:
-                await self._type_text(text)
-            await self._simple_response(message, None)
-            return
-        if params["type"] == "keyUp" and key == "Backspace":
-            manipulation = (
-                "document.activeElement.value = document.activeElement.value.slice(0, -1);"
-                "document.activeElement.dispatchEvent("
-                "    new InputEvent('input', {bubbles: true, inputType: 'deleteContentBackward'}));"
-            )
-        elif params["type"] == "char" and key == "Enter":
+        if type_ == "char":
             # The page's own Enter handling must run first (e.g. google fires its search from a
             # keydown listener on a <textarea> and prevents the default); only when the page
             # leaves the events unhandled fall back to what a browser would do by default.
@@ -2674,11 +2806,53 @@ class CdpTarget:
                 "    }"
                 "}"
             )
-        else:
-            await self._simple_response(message, None)
-            return
+            await self.evaluate_and_result(self._when_editable_js(manipulation))
+        await self._simple_response(message, None)
 
-        simulate_key_event = (
+    async def _editing_key_event(self, message: dict[str, Any]) -> None:
+        """Every key but Enter, which has its own flow above.
+
+        Each keyDown - including the auto-repeats of a held key - is dispatched to the page as a
+        keydown event first, so the page's own shortcut handlers run and can prevent the default
+        exactly as they would in a browser; when they do not, the bridge performs it in-page,
+        because WebKit has no Input domain: select-all, caret movement (Shift extending the
+        selection), Backspace and Delete (see KEY_DOWN_JS). Backspace used to act on keyUp, so a
+        held Backspace deleted one character.
+
+        Typing arrives in two shapes. DevTools sends keyDown, then a "char" event carrying the
+        character, then keyUp; Playwright never sends "char" at all and puts the character in
+        keyDown's own text field, which used to type nothing at all - silently, so a filled-in
+        form stayed empty with every call reporting success. Take the character from whichever
+        event carries it, and type it exactly once: remember what a keyDown promised, let a
+        "char" supersede it, and fall back to typing it on keyUp when no "char" follows.
+        """
+        params = message["params"]
+        type_ = params["type"]
+        if type_ in ("keyDown", "rawKeyDown"):
+            # The focused document is looked up once per key; its "char" and keyUp reuse it.
+            self._key_context = await self._focused_context()
+            outcome = await self._evaluate_key_handler(
+                self._key_context, f"{KEY_DOWN_JS}({self._key_event_init(params)})"
+            )
+            self._key_default_prevented = outcome == "prevented"
+            self._pending_key_text = None if self._key_default_prevented else self._printable_key_text(params)
+        elif type_ == "char":
+            self._pending_key_text = None
+            text = self._printable_key_text(params)
+            if text is not None and not self._key_default_prevented:
+                await self._type_text_in(self._key_context, text)
+        elif type_ == "keyUp":
+            pending, self._pending_key_text = self._pending_key_text, None
+            if pending is not None:
+                await self._type_text_in(self._key_context, pending)
+            self._key_default_prevented = False
+            await self._evaluate_key_handler(self._key_context, f"{KEY_UP_JS}({self._key_event_init(params)})")
+        await self._simple_response(message, None)
+
+    @staticmethod
+    def _when_editable_js(manipulation: str) -> str:
+        """`manipulation`, run only when the focused element takes keyboard editing."""
+        return (
             "function isEditable(element) {"
             "    if (element.disabled || element.readOnly)"
             "        return false;"
@@ -2699,8 +2873,6 @@ class CdpTarget:
             f"{manipulation}"
             "}"
         )
-        await self.evaluate_and_result(simulate_key_event)
-        await self._simple_response(message, None)
 
     async def _target_created(self, message: dict[str, Any]):
         # These handlers run inside the receive loop; a device round-trip here (the old code

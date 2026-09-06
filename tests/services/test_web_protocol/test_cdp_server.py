@@ -1751,3 +1751,115 @@ async def test_logo_is_served_as_png_under_both_names() -> None:
     assert favicon.status_code == 200
     assert favicon.headers["content-type"] == "image/png"
     assert favicon.content == logo.content
+
+
+async def testp_cdp_server_handles_editing_keys(lockdown: LockdownClient) -> None:
+    """
+    Editing keys act on the focused field the way a keyboard's would - on keyDown, so a held key
+    repeats: Backspace used to act on keyUp only, so holding it deleted one character. Cmd/Ctrl-A
+    selects all, the arrows and Home/End move the caret (with Shift extending the selection),
+    Delete deletes forward, and typing or Backspace replace whatever is selected. The page's own
+    keydown listeners run first and can prevent the default, as they would in a browser.
+    """
+    async with cdp_server_with_safari_page(lockdown) as (port, targets):
+        client = CdpWebsocketClient(port, targets[0]["id"])
+        await asyncio.wait_for(client.connect(), TIMEOUT)
+        message_ids = itertools.count(1)
+        try:
+
+            async def command(method: str, params: dict[str, Any]) -> dict[str, Any]:
+                return await client.command(next(message_ids), method, params)
+
+            async def evaluate(expression: str) -> Any:
+                response = await command("Runtime.evaluate", {"expression": expression, "returnByValue": True})
+                return response.get("result", {}).get("result", {}).get("value")
+
+            async def key(key_: str, modifiers: int = 0, repeats: int = 0) -> None:
+                """Press a key the way DevTools' screencast does: keyDown (and its auto-repeats), keyUp."""
+                params: dict[str, Any] = {"key": key_, "code": key_, "modifiers": modifiers}
+                await command("Input.dispatchKeyEvent", {"type": "keyDown", "autoRepeat": False, **params})
+                for _ in range(repeats):
+                    await command("Input.dispatchKeyEvent", {"type": "keyDown", "autoRepeat": True, **params})
+                await command("Input.dispatchKeyEvent", {"type": "keyUp", **params})
+
+            async def type_char(char: str) -> None:
+                for type_ in ("keyDown", "char", "keyUp"):
+                    params: dict[str, Any] = {"type": type_, "key": char, "code": f"Key{char.upper()}"}
+                    if type_ == "char":
+                        params["text"] = char
+                    await command("Input.dispatchKeyEvent", params)
+
+            await command("Page.enable", {})
+            await command("Runtime.enable", {})
+            await command("Page.navigate", {"url": "https://example.com/"})
+
+            async def reset_field(value: str = "") -> None:
+                await evaluate(
+                    "(function () {"
+                    "  document.body.innerHTML = '';"
+                    "  var el = document.createElement('input');"
+                    "  el.id = 'f';"
+                    "  el.type = 'text';"
+                    f"  el.value = {json.dumps(value)};"
+                    "  document.body.appendChild(el);"
+                    "  el.focus();"
+                    "  el.setSelectionRange(el.value.length, el.value.length);"
+                    "  return 'ok';"
+                    "})()"
+                )
+
+            async def field_value() -> Any:
+                return await evaluate("document.getElementById('f').value")
+
+            META, SHIFT = 4, 8
+
+            await reset_field("hello")
+            await key("Backspace", repeats=2)
+            assert await field_value() == "he", "a held Backspace must delete once per repeat"
+
+            await reset_field("hello")
+            await key("a", modifiers=META)
+            await type_char("x")
+            assert await field_value() == "x", "typing after Cmd-A must replace the whole value"
+
+            await reset_field("hello")
+            await key("a", modifiers=META)
+            await key("Backspace")
+            assert await field_value() == "", "Backspace after Cmd-A must clear the field"
+
+            await reset_field("abc")
+            await key("ArrowLeft")
+            await type_char("X")
+            assert await field_value() == "abXc", "ArrowLeft must move the caret back one character"
+
+            await key("ArrowLeft", modifiers=SHIFT, repeats=1)
+            await type_char("Y")
+            assert await field_value() == "aYc", "Shift-ArrowLeft must extend the selection, replaced by typing"
+
+            await key("Home")
+            await key("Delete")
+            assert await field_value() == "Yc", "Home then Delete must delete the first character"
+
+            await key("End")
+            await key("Backspace")
+            assert await field_value() == "Y", "End then Backspace must delete the last character"
+
+            # A page that handles the shortcut itself keeps it: preventing the default on keydown
+            # stops the bridge's select-all, exactly as it stops a browser's.
+            await reset_field("hello")
+            await evaluate(
+                "window.__keys = [];"
+                " document.getElementById('f').addEventListener('keydown', e => {"
+                "   window.__keys.push(e.key + (e.metaKey ? '+meta' : ''));"
+                "   if (e.metaKey && e.key === 'a') { e.preventDefault(); }"
+                " });"
+                " 'ok'"
+            )
+            await key("a", modifiers=META)
+            await type_char("z")
+            assert await evaluate("JSON.stringify(window.__keys)") == '["a+meta","z"]', (
+                "the page's keydown listener must see every key with its modifiers"
+            )
+            assert await field_value() == "helloz", "a page that prevents Cmd-A's default must keep its value"
+        finally:
+            await client.close()
