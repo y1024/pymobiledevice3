@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
+import httpx
 import pytest
 import uvicorn
 from wsproto import ConnectionType, WSConnection
@@ -1706,3 +1707,47 @@ async def test_a_frame_target_going_away_does_not_reset_the_frontend(monkeypatch
 
         assert target.output_queue.empty()
         assert "frame-2" not in target._destroyed_targets
+
+
+def _landing_page_app() -> Any:
+    """The bridge app wired to a fake inspector so the landing page can be served without a device."""
+
+    class _Inspector:
+        def __init__(self) -> None:
+            self.application_pages: dict[str, dict[str, Page]] = {}
+            self.connected_application: dict[str, Application] = {}
+
+        async def get_open_pages(self) -> None:
+            pass
+
+    class _Holder:
+        running = False
+
+    app.state.inspector = _Inspector()
+    app.state.holder = _Holder()
+    return app
+
+
+@pytest.mark.asyncio
+async def test_landing_page_carries_the_project_favicon_and_logo() -> None:
+    """The landing page declares the project logo as its icon and shows it next to the title."""
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=_landing_page_app()), base_url="http://t") as client:
+        html = (await client.get("/")).text
+
+    assert '<link rel="icon" type="image/png" href="/logo.png">' in html
+    assert '<img class="logo" src="/logo.png" alt="">' in html
+
+
+@pytest.mark.asyncio
+async def test_logo_is_served_as_png_under_both_names() -> None:
+    """/logo.png is the bundled PNG; /favicon.ico answers browsers that ask for the default icon path."""
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=_landing_page_app()), base_url="http://t") as client:
+        logo = await client.get("/logo.png")
+        favicon = await client.get("/favicon.ico")
+
+    assert logo.status_code == 200
+    assert logo.headers["content-type"] == "image/png"
+    assert logo.content.startswith(b"\x89PNG\r\n\x1a\n")
+    assert favicon.status_code == 200
+    assert favicon.headers["content-type"] == "image/png"
+    assert favicon.content == logo.content
