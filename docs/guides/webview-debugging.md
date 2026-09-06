@@ -92,6 +92,54 @@ Configuration notes:
 - Source-map warnings for third-party pages you don't control are harmless; silence
   them with `"sourceMaps": false` if they get noisy.
 
+### JSContexts in VS Code
+
+The landing page at `http://127.0.0.1:9222/` has an **Attach from VS Code** section
+under every target with the configuration that attaches to exactly it; copy it into
+`launch.json`. What those configurations look like, and why:
+
+The `chrome` attach above only takes web pages; js-debug ignores the JSContexts the
+bridge lists (they are advertised as `node` targets). Attach to a JSContext with a
+`node` configuration pointed straight at its websocket:
+
+```json
+{
+    "name": "Attach to JSContext",
+    "type": "node",
+    "request": "attach",
+    "websocketAddress": "ws://127.0.0.1:9222/devtools/page/PID:1234:1"
+}
+```
+
+The address is the `webSocketDebuggerUrl` of the target in
+`http://127.0.0.1:9222/json/list` (the landing page links carry the same
+`PID:<pid>:<page>` id). A plain `"port": 9222` does not work for this: js-debug then
+takes the browser socket from `/json/version`, which is not a JavaScript target.
+
+To browse rather than name one, open the landing page: every JSContext has an
+**Attach from VS Code** block with exactly this config (its own `websocketAddress`),
+ready to copy. js-debug's `chrome` target picker does not list JSContexts - it debugs
+them through the Node path above.
+
+A child session named "Remote Process" appears with the context's scripts; the Debug
+Console evaluates in it. With **Pause new JSContexts on launch** on, a context created
+while the bridge runs comes up stopped on its first statement, so a breakpoint set
+before it runs is hit.
+
+## WebStorm
+
+WebStorm attaches through the same listing: **Run > Edit Configurations > Add >
+Attach to Node.js/Chrome**, host `127.0.0.1`, port `9222`, attach to *Chrome or
+Node.js > 6.3 started with --inspect*. Starting that configuration in Debug opens a
+**Choose Page to Debug** list with every inspectable page and JSContext on the device;
+pick one and the session attaches to it. Breakpoints and the debug console work on a
+Safari page; the bridge answers WebStorm's `Debugger.setSkipAllPauses` with an error
+WebKit does not know the method, which WebStorm tolerates.
+
+WebStorm builds a Node-style target out of a `node` entry's `url`, so JSContexts are
+listed under a `jscontext://<bundle id>/<pid>/<page>` URL. An empty one made WebStorm
+fail with "Malformed URL" as soon as a JSContext was picked.
+
 ## Test automation (Playwright, Puppeteer)
 
 A Chrome-protocol automation framework attaches through the same browser-level
@@ -137,6 +185,59 @@ Notes worth knowing when scripting against a device:
   `promise` subtype, because the bridge recognises built-ins by their class name.
   `await` still behaves; only code that inspects the subtype is affected.
 
+## Attaching before a page or context runs
+
+Safari's Develop menu can attach to every JSContext an app creates, before the
+context runs its first line ("Automatically Show Web Inspector for JSContexts"), and
+optionally stop it there ("Automatically Pause Connecting to JSContexts"). The bridge
+offers the same through the Chrome protocol: a client that enables
+`Target.setAutoAttach` with `waitForDebuggerOnStart` — VS Code, Playwright and
+Puppeteer all do by default — is attached to each new debuggable before it runs.
+
+What happens per kind of debuggable, because WebKit treats them differently:
+
+- **JSContexts** (and service workers) are held by the app itself: it blocks the
+  thread creating the context until the client has attached and released it with
+  `Runtime.runIfWaitingForDebugger`, which the clients above send once their
+  breakpoints are in place. So a breakpoint on the first line of a context's script
+  hits. WebKit gives up on a debugger that does not release the context within ten
+  seconds and lets the app continue.
+- **WKWebView pages** cannot be held before they run: WebKit offers no hook for it.
+  The bridge attaches the moment the device pushes the listing the page appears in
+  (rather than waiting for the next periodic poll), and reports the attachment with
+  `waitingForDebugger: false`. Once attached, a cross-site navigation of that page
+  creates a new process, and the bridge does hold that one — WebKit's
+  `Target.setPauseOnStart` — until the client's debugger state has been replayed
+  into it, so breakpoints hit from the new document's first script on.
+
+While such a client is connected, every app on the device holds each new JSContext
+for it; the bridge switches this off again when the client detaches. Candidates
+nobody can take — for example a page that never made it into the listing — are
+declined immediately so no app waits.
+
+### Pause new JSContexts on launch
+
+Safari's "Automatically Pause Connecting to JSContexts" has a bridge equivalent that
+also works from the landing page, where DevTools cannot attach before a context
+exists: `pymobiledevice3 webinspector cdp --pause-new-targets`, or the
+**Pause new JSContexts on launch** switch at the top of `http://127.0.0.1:9222/`.
+The flag only sets the switch's initial state; it can be turned on and off while the
+bridge runs.
+
+While it is on, the bridge itself accepts every JSContext an app creates, before the
+context runs: it enables the debugger, lets the app continue, and WebKit stops the
+context on its first statement. The context is listed with a **paused** badge; open
+it and DevTools comes up in the Sources panel on that pause, with the scripts it
+parsed so far. Resume from there as usual. A context nobody opens stays paused until
+it is opened or the switch is turned off, which lets every held context go.
+
+Clients that auto-attach (VS Code, Playwright) get the same held sessions, already
+released, and see the pause once their debugger is enabled. Pages cannot be held
+before they run; with the switch on, a page a client auto-attaches is paused on its
+next statement after the client's debugger comes up, and a cross-site navigation of
+an attached page pauses on the new document's first statement. Debuggables that
+already existed when a client attached keep running, as in Safari.
+
 ## Caveats
 
 - WebKit allows a single inspector session per page, so two *separate* debuggers
@@ -145,5 +246,5 @@ Notes worth knowing when scripting against a device:
   skipped after a short wait — detach the other client first. A single client may
   open as many CDP sessions onto a page as it likes (Playwright does this when a
   script also opens a raw `newCDPSession`); those share the one underlying session.
-- The page listing is polled, so tabs opened on the device after the attach are
-  discovered (and auto-attached) within a couple of seconds.
+- The page listing is polled as a fallback, so a tab the device did not announce on
+  its own is still discovered (and auto-attached) within a couple of seconds.
